@@ -84,7 +84,7 @@ pub struct UuRingLane {
 
 struct UuRingLaneStore {
     name: String,
-    buffer: VecDeque<UuRingLaneRow>,
+    buffer: VecDeque<Arc<UuRingLaneRow>>,
     capacity: usize,
     dimension: usize,
 }
@@ -143,8 +143,10 @@ impl UuRingLane {
         use_safety_limit: bool,
     ) -> Result<Self, UuRingLaneError> {
         if use_safety_limit {
-            // Box<[Uuid]> のサイズ（ポインタ+長さ）+ 実体(16B * dimension)
-            let row_mem = std::mem::size_of::<Box<[Uuid]>>() as u64 + (16 * dimension as u64);
+            // Arc<UuRingLaneRow> のヒープ消費量:
+            // Arc 制御ブロック(約24B) + UuRingLaneRow(16B) + ヒープ上の実体(16B * dimension)
+            let row_mem =
+                40 + std::mem::size_of::<UuRingLaneRow>() as u64 + (16 * dimension as u64);
             let required_bytes = capacity as u64 * row_mem;
 
             let mut sys = System::new_all();
@@ -199,7 +201,7 @@ impl UuRingLane {
             if store.buffer.len() >= store.capacity {
                 store.buffer.pop_back();
             }
-            store.buffer.push_front(item);
+            store.buffer.push_front(Arc::new(item));
         }
         Ok(())
     }
@@ -215,7 +217,7 @@ impl UuRingLane {
     /// * `limit` - 抽出する最大件数。この数に達した時点で検索を打ち切ります。
     ///
     /// # 戻り値
-    /// 条件に一致した [UuRingLaneRow] のベクタ。
+    /// 条件に一致した [UuRingLaneRow] の参照（[Arc]）のベクタ。
     ///
     /// # 例
     /// インデックス1（著者ID）が自分のフォローリストに含まれる投稿を検索する場合：
@@ -227,12 +229,16 @@ impl UuRingLane {
         index: usize,
         targets: &HashSet<Uuid>,
         limit: usize,
-    ) -> Vec<UuRingLaneRow> {
+    ) -> Vec<Arc<UuRingLaneRow>> {
         let store = self.inner.read();
         store
             .buffer
             .iter()
             .filter(|s| {
+                // いずれかのカラムに Uuid::nil() が含まれる場合は、論理的に削除（忘却）されたとみなしてスキップ
+                if s.values.iter().any(|v| v.is_nil()) {
+                    return false;
+                }
                 s.values
                     .get(index)
                     .map_or(false, |val| targets.contains(val))
@@ -240,6 +246,58 @@ impl UuRingLane {
             .take(limit)
             .cloned()
             .collect()
+    }
+
+    /// 指定された次元（インデックス）の値が ID と一致する行を特定し、そのスロットを Uuid::nil() で上書きします。
+    ///
+    /// これにより、その行は以降の `curate_by` などの検索から論理的に除外（忘却）されます。
+    ///
+    /// # 引数
+    /// * `index` - 検索対象とする次元のインデックス。
+    /// * `id` - 忘却させたい UUID。
+    pub fn purge_by_id(&self, index: usize, id: Uuid) {
+        if id.is_nil() {
+            return;
+        }
+        let mut store = self.inner.write();
+        for row in store.buffer.iter_mut() {
+            if let Some(val) = row.values.get(index) {
+                if *val == id {
+                    // 検索等で共有されている可能性があるため、クローンしてから置換（Copy-on-Write）
+                    let mut new_row = (**row).clone();
+                    if let Some(v) = new_row.values.get_mut(index) {
+                        *v = Uuid::nil();
+                    }
+                    *row = Arc::new(new_row);
+                }
+            }
+        }
+    }
+
+    /// UUID v7 の時系列特性を利用して、指定されたミリ秒（Unix Epoch）より古いデータを論理的に削除（忘却）します。
+    ///
+    /// 内部的には `as_u128()` による高速なビット比較を行い、閾値未満の UUID を持つスロットを `Uuid::nil()` で上書きします。
+    /// 追加のメモリ（タイムスタンプ保持用など）は一切使用せず、フラットなデータ構造を維持します。
+    ///
+    /// # 引数
+    /// * `index` - 比較対象の UUID v7 が格納されている次元のインデックス。
+    /// * `threshold_ms` - 削除の閾値となる Unix タイムスタンプ（ミリ秒）。これより古いデータが削除されます。
+    pub fn vacate_expired(&self, index: usize, threshold_ms: u64) {
+        // UUID v7 の上位48ビットはミリ秒単位のタイムスタンプ
+        let threshold_u128 = (threshold_ms as u128) << 80;
+        let mut store = self.inner.write();
+        for row in store.buffer.iter_mut() {
+            if let Some(val) = row.values.get(index) {
+                // nil でなく、かつタイムスタンプが閾値未満の場合は忘却させる
+                if !val.is_nil() && val.as_u128() < threshold_u128 {
+                    let mut new_row = (**row).clone();
+                    if let Some(v) = new_row.values.get_mut(index) {
+                        *v = Uuid::nil();
+                    }
+                    *row = Arc::new(new_row);
+                }
+            }
+        }
     }
 
     /// 既存のデータをすべて破棄し、指定された新しいデータセットでメモリを満たします。
@@ -268,7 +326,9 @@ impl UuRingLane {
         }
 
         store.buffer.clear();
-        store.buffer.extend(rows.into_iter().take(limit));
+        store
+            .buffer
+            .extend(rows.into_iter().take(limit).map(Arc::new));
         Ok(())
     }
 
@@ -344,6 +404,76 @@ mod tests {
         let results = pool.curate_by(1, &targets, 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].values[0], post_id);
+
+        pool.vacate();
+    }
+
+    #[test]
+    fn test_purge_by_id() {
+        let label = "purge_pool";
+        let pool = UuRingLane::init(label, 10, 2).unwrap();
+
+        let post_id = Uuid::now_v7();
+        let author_id = Uuid::now_v7();
+
+        pool.insert_batch(vec![UuRingLaneRow {
+            values: Box::new([post_id, author_id]),
+        }])
+        .unwrap();
+
+        // 1. 最初は検索にヒットする
+        let mut targets = HashSet::new();
+        targets.insert(author_id);
+        assert_eq!(pool.curate_by(1, &targets, 10).len(), 1);
+
+        // 2. purge_by_id で PostID を指定して「忘却」させる
+        pool.purge_by_id(0, post_id);
+
+        // 3. AuthorID で検索してもヒットしなくなる（行内に nil が含まれるため）
+        assert_eq!(pool.curate_by(1, &targets, 10).len(), 0);
+
+        pool.vacate();
+    }
+
+    #[test]
+    fn test_vacate_expired() {
+        let label = "expire_pool";
+        let pool = UuRingLane::init(label, 10, 1).unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // 1. 10秒前のUUIDを作成して挿入
+        // (厳密には version 7 ではないが、u128比較のロジックテストとして十分)
+        let old_ts = now_ms - 10000;
+        let old_uuid = Uuid::from_u128((old_ts as u128) << 80);
+        pool.insert_batch(vec![UuRingLaneRow {
+            values: Box::new([old_uuid]),
+        }])
+        .unwrap();
+
+        // 2. 現在のUUIDを挿入
+        let new_uuid = Uuid::now_v7();
+        pool.insert_batch(vec![UuRingLaneRow {
+            values: Box::new([new_uuid]),
+        }])
+        .unwrap();
+
+        assert_eq!(pool.len(), 2);
+
+        // 3. 5秒前を閾値にして期限切れを削除
+        pool.vacate_expired(0, now_ms - 5000);
+
+        // 4. curate_by で確認（old_uuid は消え、new_uuid だけ残っているはず）
+        let mut targets = HashSet::new();
+        targets.insert(old_uuid);
+        targets.insert(new_uuid);
+
+        let results = pool.curate_by(0, &targets, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].values[0], new_uuid);
 
         pool.vacate();
     }
